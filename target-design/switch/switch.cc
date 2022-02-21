@@ -11,6 +11,8 @@
 #include <omp.h>
 #include <cstdlib>
 #include <arpa/inet.h>
+#include <stdatomic.h>
+#include "nf_trace.h"
 
 #define IGNORE_PRINTF
 
@@ -84,6 +86,131 @@ uint64_t this_iter_cycles_start = 0;
 // could be hardcoded
 
 BasePort * ports[NUMPORTS];
+
+void send_packet(pkt_t* pkt, uint16_t send_to_port) {
+    int data_packet_size_bytes = pkt->len;
+
+    // Convert the packet to a switchpacket
+    switchpacket* new_tsp = (switchpacket*)calloc(sizeof(switchpacket), 1);
+    new_tsp->timestamp = this_iter_cycles_start;
+    new_tsp->amtwritten = data_packet_size_bytes / sizeof(uint64_t);
+    new_tsp->amtread = 0;
+    new_tsp->sender = 0;
+    memcpy(new_tsp->dat, pkt->content, data_packet_size_bytes);
+
+    ports[port]->outputqueue_high.push(tsp);
+    ports[port]->outputqueue_high_size += new_tsp->amtwritten * sizeof(uint64_t);
+}
+
+// TODO: add boot packet indicating NF has all finishes initlization.
+// TODO: add packet timeout mechinism
+
+#define TEST_NPKTS (2*50*1024)
+#define PRINT_INTERVAL (10 * 1024)
+#define MAX_BATCH_SIZE 32
+#define MAX_UNACK_WINDOW 512
+#define CUSTOM_PROTO_BASE 0x1234
+
+void generate_load_packets() {
+    for (int nf_idx = 0; nf_idx < 4; nf_idx ++) {
+        // this NF has processed all packets.
+        if (sent_pkts[nf_idx] > TEST_NPKTS) {
+            continue;
+        }
+        // so many unacked packets, not send load packets.
+        if (sent_pkts[nf_idx] >= received_pkts[nf_idx] && (unack_pkts[nf_idx] = sent_pkts[nf_idx] - received_pkts[nf_idx]) >= MAX_UNACK_WINDOW) {
+            continue;
+        }
+
+    // uint32_t waiting_cycles = 0;
+    //     while(sent_pkts[nf_idx] >= received_pkts[nf_idx] && (unack_pkts[nf_idx] = sent_pkts[nf_idx] - received_pkts[nf_idx]) >= MAX_UNACK_WINDOW){
+    //         try_recv_pkt(nf_idx);
+    //         // ad-hoc solution to break deadlock caused by packet loss -- should rarely happen
+    //         waiting_cycles ++;
+    //         if(waiting_cycles > MAX_WAITING_CYCLES){
+    //             lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
+    //             sent_pkts[nf_idx] = received_pkts[nf_idx];
+    //             printf("[send_pacekts th%d]: deadlock detected (caused by packet loss or NF initing), forcely resolving...\n", nf_idx);
+    //         }
+    //         if(force_quit[nf_idx])
+	// 			break;
+    //     }
+    //     // max_waiting_cycles = MAX(max_waiting_cycles, waiting_cycles);
+    //     waiting_cycles = 0;
+
+        burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
+        burst_size = MIN(burst_size, TEST_NPKTS + WARMUP_NPKTS - sent_pkts[nf_idx]);
+
+        for(int i = 0; i < burst_size; i++){
+            pkt_t* pkt = next_pkt(nf_idx);
+        	
+            eh = (struct ether_hdr*)(pkt->content + NET_IP_ALIGN);
+            eh->ether_type = htons((uint16_t)nf_idx + CUSTOM_PROTO_BASE);
+
+            tcph = (struct tcp_hdr *) (pkt->content + NET_IP_ALIGN + sizeof(struct ipv4_hdr) + sizeof(struct ether_hdr));
+            tcph->sent_seq = 0xdeadbeef;
+            tcph->recv_ack = sent_pkts[nf_idx] + i;
+
+            // inter-pkt frame
+            sent_pkts_size[nf_idx] += pkt->len + 20;
+
+            // ASSUME there is only one port
+            send_packet(pkt, 0);
+        }
+        sent_pkts[nf_idx] += burst_size;
+
+        if((sent_pkts[nf_idx] / MAX_BATCH_SIZE) % (PRINT_INTERVAL / MAX_BATCH_SIZE) == 0){
+            printf("[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %llu, potentially lost pkts: %llu\n", nf_idx, sent_pkts[nf_idx], unack_pkts[nf_idx], lost_pkts[nf_idx]);
+        }
+    }
+}
+
+#define MAX_WAITING_CYCLES 2999538 // this is from empirical tests 
+
+static atomic_ullong unack_pkts[4] = {0,0,0,0};
+static atomic_ullong sent_pkts[4] = {0,0,0,0};
+static atomic_ullong sent_pkts_size[4] = {0,0,0,0};
+static atomic_ullong received_pkts[4] = {0,0,0,0};
+static atomic_ullong lost_pkts[4] = {0,0,0,0};
+
+static atomic_uchar force_quit[4];
+static atomic_uchar finished_nfs = 0;
+static atomic_ullong invalid_pkts = 0;
+
+void process_recv_packet(uint8_t* pkt_data) {
+    struct ether_hdr *eh_recv = (struct ether_hdr *)(pkt_data + NET_IP_ALIGN);
+	struct tcp_hdr * tcph_recv = (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) + sizeof(struct ether_hdr));
+    int nf_idx = (int)htons((eh_recv->ether_type)) - CUSTOM_PROTO_BASE;
+
+    // printf("[recv_pacekts %d] nf_idx = %d, tcph->sent_seq = %x\n", nf_idx, nf_idx, tcph->sent_seq);
+
+    if(tcph_recv->sent_seq != 0xdeadbeef){
+        invalid_pkts ++;
+        continue;
+    }
+    if(nf_idx < 4)
+        received_pkts[nf_idx] ++;
+
+    uint32_t pkt_idx = tcph_recv->recv_ack;
+    uint64_t curr_received_pkts = received_pkts[nf_idx];
+    uint32_t lost_pkts = pkt_idx + 1 - curr_received_pkts;
+
+    // TODO: the packets might get re-ordered. 
+    // printf("%lu, %llu\n", pkt_idx, curr_received_pkts);
+    
+    // these packets are lost
+    // if(lost_pkts != 0){
+    //     received_pkts[nf_idx] += lost_pkts
+    // }
+
+    if(curr_received_pkts % PRINT_INTERVAL == 0){
+        printf("[recv_pacekts th%d]: pkts received: %llu\n", nf_idx, curr_received_pkts);
+    }
+
+    if(tcph_recv->recv_ack == 0xFFFFFFFF){
+        return;
+    }
+}
 
 /* switch from input ports to output ports */
 void do_fast_switching() {
@@ -169,6 +296,7 @@ while (!pqueue.empty()) {
     uint16_t send_to_port = get_port_from_flit(tsp->dat[0], 0 /* junk remove arg */);
     //printf("packet for port: %x\n", send_to_port);
     //printf("packet timestamp: %ld\n", tsp->timestamp);
+    /* we bypass the switching logic, just doing ack packet processing and load generaion
     if (send_to_port == BROADCAST_ADJUSTED) {
 #define ADDUPLINK (NUMUPLINKS > 0 ? 1 : 0)
         // this will only send broadcasts to the first (zeroeth) uplink.
@@ -185,8 +313,12 @@ while (!pqueue.empty()) {
     } else {
         ports[send_to_port]->outputqueue.push(tsp);
     }
+    */
+    process_recv_packet((uint8_t*)tsp->dat);
+    free(tsp);
 }
 
+generate_load_packets();
 
 // finally in parallel, flush whatever we can to the output queues based on timestamp
 
@@ -239,6 +371,16 @@ int main (int argc, char *argv[]) {
         // if invalid link latency, error out.
         fprintf(stdout, "INVALID LINKLATENCY. Currently must be multiple of 7 cycles.\n");
         exit(1);
+    }
+
+    // loading nf workload traces
+    load_pkt("/tmp/ictf2010_100kflow.dat");
+    #define MAC_NFTOP   0x0200006d1200
+    #define ETH_P_IP	0x0800		/* Internet Protocol packet	*/
+    for(int i = 0; i < PKT_NUM; i++){
+        uint64_t* pkt_bytes = (uint64_t*)pkts[i].content;
+        pkt_bytes[0] = MAC_NFTOP << 16;
+        pkt_bytes[1] = MAC_NFTOP | ((uint64_t)htons(ETH_P_IP) << 48);
     }
 
     omp_set_num_threads(NUMPORTS); // we parallelize over ports, so max threads = # ports
