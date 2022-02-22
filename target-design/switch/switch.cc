@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <arpa/inet.h>
 #include <stdatomic.h>
+#include <atomic>
 #include "nf_trace.h"
 
 #define IGNORE_PRINTF
@@ -93,7 +94,7 @@ void send_packet(pkt_t* pkt, uint16_t send_to_port) {
     // Convert the packet to a switchpacket
     switchpacket* new_tsp = (switchpacket*)calloc(sizeof(switchpacket), 1);
     new_tsp->timestamp = this_iter_cycles_start;
-    new_tsp->amtwritten = data_packet_size_bytes / sizeof(uint64_t);
+    new_tsp->amtwritten = (data_packet_size_bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t);
     new_tsp->amtread = 0;
     new_tsp->sender = 0;
     memcpy(new_tsp->dat, pkt->content, data_packet_size_bytes);
@@ -102,8 +103,7 @@ void send_packet(pkt_t* pkt, uint16_t send_to_port) {
     ports[port]->outputqueue_high_size += new_tsp->amtwritten * sizeof(uint64_t);
 }
 
-// TODO: add boot packet indicating NF has all finishes initlization.
-// TODO: add packet timeout mechinism
+// TODO: maybe only stop all other's pktgen after the slowest NF processes certain number of packets
 
 #define TEST_NPKTS (2*50*1024)
 #define PRINT_INTERVAL (10 * 1024)
@@ -111,32 +111,51 @@ void send_packet(pkt_t* pkt, uint16_t send_to_port) {
 #define MAX_UNACK_WINDOW 512
 #define CUSTOM_PROTO_BASE 0x1234
 
+#define TIMEOUT_CYCLES 2999538 // this is from empirical tests 
+#define NCORES 4
+
+static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
+static atomic_uint num_ready_nfs = 0;
+
+static atomic_ullong unack_pkts[NCORES] = {0};
+static atomic_ullong sent_pkts[NCORES] = {0};
+static atomic_ullong sent_pkts_size[NCORES] = {0};
+static atomic_ullong received_pkts[NCORES] = {0};
+static atomic_ullong lost_pkts[NCORES] = {0};
+static atomic_ullong last_gen_pkt_timestamp[NCORES] = {0};
+static atomic_ullong invalid_pkts = 0;
+
+static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
+static atomic_uint num_finished_nfs = 0;
+static atomic_ullong start_gen_pkt_timestamp = 0;
+static atomic_ullong finish_gen_pkt_timestamp[NCORES] = {0};
+
 void generate_load_packets() {
+    if (num_ready_nfs != NCORES) {
+        return;
+    }
     for (int nf_idx = 0; nf_idx < 4; nf_idx ++) {
         // this NF has processed all packets.
         if (sent_pkts[nf_idx] > TEST_NPKTS) {
+            if (!nf_finishness[nf_idx].test_and_set()) {
+                num_finished_nfs ++;
+                finish_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
+                double time_taken = (finish_gen_pkt_timestamp[nf_idx] - start_gen_pkt_timestamp) / CPU_GHZ * 1e-3;
+                printf("[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %4llu, potentially lost pkts: %4llu, %.8lf Mpps, %.6lfGbps\n", nf_idx, sent_pkts[nf_idx], unack_pkts[nf_idx], lost_pkts[nf_idx], (double)(sent_pkts[nf_idx]) / time_taken, (double)sent_pkts_size[nf_idx] * 8 / (time_taken * 1e3));
+            }
             continue;
         }
         // so many unacked packets, not send load packets.
         if (sent_pkts[nf_idx] >= received_pkts[nf_idx] && (unack_pkts[nf_idx] = sent_pkts[nf_idx] - received_pkts[nf_idx]) >= MAX_UNACK_WINDOW) {
-            continue;
+            if (this_iter_cycles_start - last_gen_pkt_timestamp[nf_idx] > TIMEOUT_CYCLES) {
+                lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
+                sent_pkts[nf_idx] = received_pkts[nf_idx];
+                printf("[send_pacekts th%d]: deadlock detected (caused by packet loss or NF initing), forcely resolving...\n", nf_idx);
+            } else {
+                continue;
+            }
         }
-
-    // uint32_t waiting_cycles = 0;
-    //     while(sent_pkts[nf_idx] >= received_pkts[nf_idx] && (unack_pkts[nf_idx] = sent_pkts[nf_idx] - received_pkts[nf_idx]) >= MAX_UNACK_WINDOW){
-    //         try_recv_pkt(nf_idx);
-    //         // ad-hoc solution to break deadlock caused by packet loss -- should rarely happen
-    //         waiting_cycles ++;
-    //         if(waiting_cycles > MAX_WAITING_CYCLES){
-    //             lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
-    //             sent_pkts[nf_idx] = received_pkts[nf_idx];
-    //             printf("[send_pacekts th%d]: deadlock detected (caused by packet loss or NF initing), forcely resolving...\n", nf_idx);
-    //         }
-    //         if(force_quit[nf_idx])
-	// 			break;
-    //     }
-    //     // max_waiting_cycles = MAX(max_waiting_cycles, waiting_cycles);
-    //     waiting_cycles = 0;
+        last_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
 
         burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
         burst_size = MIN(burst_size, TEST_NPKTS + WARMUP_NPKTS - sent_pkts[nf_idx]);
@@ -165,31 +184,37 @@ void generate_load_packets() {
     }
 }
 
-#define MAX_WAITING_CYCLES 2999538 // this is from empirical tests 
-
-static atomic_ullong unack_pkts[4] = {0,0,0,0};
-static atomic_ullong sent_pkts[4] = {0,0,0,0};
-static atomic_ullong sent_pkts_size[4] = {0,0,0,0};
-static atomic_ullong received_pkts[4] = {0,0,0,0};
-static atomic_ullong lost_pkts[4] = {0,0,0,0};
-
-static atomic_uchar force_quit[4];
-static atomic_uchar finished_nfs = 0;
-static atomic_ullong invalid_pkts = 0;
-
+// Processing packet received from the NIC, updating the above states accordingly
+// ether_type == CUSTOM_PROTO_BASE + nf_idx: Packets from NIC core nf_idx
+// ether_type == CUSTOM_PROTO_BASE + NCORES + nf_idx: Boot packet used by NIC core to indicate the readyness of one NF
 void process_recv_packet(uint8_t* pkt_data) {
     struct ether_hdr *eh_recv = (struct ether_hdr *)(pkt_data + NET_IP_ALIGN);
-	struct tcp_hdr * tcph_recv = (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) + sizeof(struct ether_hdr));
-    int nf_idx = (int)htons((eh_recv->ether_type)) - CUSTOM_PROTO_BASE;
+    int ether_type = (int)htons((eh_recv->ether_type));
+    if (!(ether_addr >= CUSTOM_PROTO_BASE && ether_addr < CUSTOM_PROTO_BASE + 2 * NCORES)) {
+        return;
+    }
 
+    // processing boot packets.
+    int nf_idx = ether_type - CUSTOM_PROTO_BASE;
+    if (nf_idx >= NCORES) {
+        nf_idx -= NCORES;
+        if (!nf_readyness[nf_idx].test_and_set()) {
+            num_ready_nfs ++;
+            if (num_ready_nfs == NCORES) {
+                start_gen_pkt_timestamp = this_iter_cycles_start;
+            }
+        }
+        return;
+    }
+
+	struct tcp_hdr * tcph_recv = (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) + sizeof(struct ether_hdr));
     // printf("[recv_pacekts %d] nf_idx = %d, tcph->sent_seq = %x\n", nf_idx, nf_idx, tcph->sent_seq);
 
     if(tcph_recv->sent_seq != 0xdeadbeef){
         invalid_pkts ++;
-        continue;
+        return;
     }
-    if(nf_idx < 4)
-        received_pkts[nf_idx] ++;
+    received_pkts[nf_idx] ++;
 
     uint32_t pkt_idx = tcph_recv->recv_ack;
     uint64_t curr_received_pkts = received_pkts[nf_idx];
