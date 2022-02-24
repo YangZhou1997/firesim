@@ -604,6 +604,14 @@ class InstanceDeployManager:
         for filename in files_to_copy:
             with StreamLogger('stdout'), StreamLogger('stderr'):
                 put(filename, remote_switch_dir, mirror_local_mode=True)
+                
+        # copy nf trace from local machines to remote
+        files_to_copy = ['/home/centos/firesim/target-design/switch/ictf2010_100kflow_2mseq.dat', 
+                         '/home/centos/firesim/target-design/switch/ictf2010_100kflow.dat']
+        remote_switch_dir = '/tmp/'
+        for filename in files_to_copy:
+          with StreamLogger('stdout'), StreamLogger('stderr'):
+              put(filename, remote_switch_dir, mirror_local_mode=True)
 
     def start_switch_slot(self, switchslot):
         self.instance_logger("""Starting switch simulation for switch slot: {}.""".format(switchslot))
