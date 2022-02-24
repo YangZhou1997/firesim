@@ -1,6 +1,5 @@
 #include <arpa/inet.h>
 #include <omp.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -90,6 +89,18 @@ uint64_t this_iter_cycles_start = 0;
 
 BasePort *ports[NUMPORTS];
 
+void load_nf_trace() {
+  // loading nf workload traces
+  load_pkt();
+#define MAC_NFTOP 0x0200006d1200
+#define ETH_P_IP 0x0800 /* Internet Protocol packet	*/
+  for (int i = 0; i < PKT_NUM; i++) {
+    uint64_t *pkt_bytes = (uint64_t *)pkts[i].content;
+    pkt_bytes[0] = MAC_NFTOP << 16;
+    pkt_bytes[1] = MAC_NFTOP | ((uint64_t)htons(ETH_P_IP) << 48);
+  }
+}
+
 void send_packet(pkt_t *pkt, uint16_t send_to_port) {
   int data_packet_size_bytes = pkt->len;
 
@@ -102,8 +113,7 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
   new_tsp->sender = 0;
   memcpy(new_tsp->dat, pkt->content, data_packet_size_bytes);
 
-  ports[port]->outputqueue_high.push(tsp);
-  ports[port]->outputqueue_high_size += new_tsp->amtwritten * sizeof(uint64_t);
+  ports[send_to_port]->outputqueue.push(new_tsp);
 }
 
 // TODO: maybe only stop all other's pktgen after the slowest NF processes
@@ -119,20 +129,20 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 #define NCORES 4
 
 static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
-static atomic_uint num_ready_nfs = 0;
+static std::atomic<uint32_t> num_ready_nfs;
 
-static atomic_ullong unack_pkts[NCORES] = {0};
-static atomic_ullong sent_pkts[NCORES] = {0};
-static atomic_ullong sent_pkts_size[NCORES] = {0};
-static atomic_ullong received_pkts[NCORES] = {0};
-static atomic_ullong lost_pkts[NCORES] = {0};
-static atomic_ullong last_gen_pkt_timestamp[NCORES] = {0};
-static atomic_ullong invalid_pkts = 0;
+static std::atomic<uint64_t> unack_pkts[NCORES] = {};
+static std::atomic<uint64_t> sent_pkts[NCORES] = {};
+static std::atomic<uint64_t> sent_pkts_size[NCORES] = {};
+static std::atomic<uint64_t> received_pkts[NCORES] = {};
+static std::atomic<uint64_t> lost_pkts[NCORES] = {};
+static std::atomic<uint64_t> last_gen_pkt_timestamp[NCORES] = {};
+static std::atomic<uint64_t> invalid_pkts;
 
 static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
-static atomic_uint num_finished_nfs = 0;
-static atomic_ullong start_gen_pkt_timestamp = 0;
-static atomic_ullong finish_gen_pkt_timestamp[NCORES] = {0};
+static std::atomic<uint32_t> num_finished_nfs;
+static std::atomic<uint64_t> start_gen_pkt_timestamp;
+static std::atomic<uint64_t> finish_gen_pkt_timestamp[NCORES] = {};
 
 void generate_load_packets() {
   if (num_ready_nfs != NCORES) {
@@ -144,6 +154,7 @@ void generate_load_packets() {
       if (!nf_finishness[nf_idx].test_and_set()) {
         num_finished_nfs++;
         finish_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
+#define CPU_GHZ (3.2)
         double time_taken =
             (finish_gen_pkt_timestamp[nf_idx] - start_gen_pkt_timestamp) /
             CPU_GHZ * 1e-3;
@@ -163,7 +174,7 @@ void generate_load_packets() {
       if (this_iter_cycles_start - last_gen_pkt_timestamp[nf_idx] >
           TIMEOUT_CYCLES) {
         lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
-        sent_pkts[nf_idx] = received_pkts[nf_idx];
+        sent_pkts[nf_idx] = received_pkts[nf_idx].load();
         printf(
             "[send_pacekts th%d]: deadlock detected (caused by packet loss or "
             "NF initing), forcely resolving...\n",
@@ -174,16 +185,16 @@ void generate_load_packets() {
     }
     last_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
 
-    burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
-    burst_size = MIN(burst_size, TEST_NPKTS + WARMUP_NPKTS - sent_pkts[nf_idx]);
+    uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
+    burst_size = std::min(burst_size, TEST_NPKTS - sent_pkts[nf_idx]);
 
     for (int i = 0; i < burst_size; i++) {
       pkt_t *pkt = next_pkt(nf_idx);
 
-      eh = (struct ether_hdr *)(pkt->content + NET_IP_ALIGN);
+      auto eh = (struct ether_hdr *)(pkt->content + NET_IP_ALIGN);
       eh->ether_type = htons((uint16_t)nf_idx + CUSTOM_PROTO_BASE);
 
-      tcph = (struct tcp_hdr *)(pkt->content + NET_IP_ALIGN +
+      auto tcph = (struct tcp_hdr *)(pkt->content + NET_IP_ALIGN +
                                 sizeof(struct ipv4_hdr) +
                                 sizeof(struct ether_hdr));
       tcph->sent_seq = 0xdeadbeef;
@@ -215,8 +226,8 @@ void generate_load_packets() {
 void process_recv_packet(uint8_t *pkt_data) {
   struct ether_hdr *eh_recv = (struct ether_hdr *)(pkt_data + NET_IP_ALIGN);
   int ether_type = (int)htons((eh_recv->ether_type));
-  if (!(ether_addr >= CUSTOM_PROTO_BASE &&
-        ether_addr < CUSTOM_PROTO_BASE + 2 * NCORES)) {
+  if (!(ether_type >= CUSTOM_PROTO_BASE &&
+        ether_type < CUSTOM_PROTO_BASE + 2 * NCORES)) {
     return;
   }
 
@@ -347,24 +358,27 @@ void do_fast_switching() {
         get_port_from_flit(tsp->dat[0], 0 /* junk remove arg */);
     // printf("packet for port: %x\n", send_to_port);
     // printf("packet timestamp: %ld\n", tsp->timestamp);
-    /* we bypass the switching logic, just doing ack packet processing and load
-generaion if (send_to_port == BROADCAST_ADJUSTED) { #define ADDUPLINK
-(NUMUPLINKS > 0 ? 1 : 0)
-        // this will only send broadcasts to the first (zeroeth) uplink.
-        // on a switch receiving broadcast packet from an uplink, this should
-        // automatically prevent switch from sending the broadcast to any uplink
-        for (int i = 0; i < NUMDOWNLINKS + ADDUPLINK; i++) {
-            if (i != tsp->sender ) {
-                switchpacket * tsp2 =
-(switchpacket*)malloc(sizeof(switchpacket)); memcpy(tsp2, tsp,
-sizeof(switchpacket)); ports[i]->outputqueue.push(tsp2);
-            }
+    // we bypass the switching logic, just doing ack packet processing and load
+    // generaion
+/*
+    if (send_to_port == BROADCAST_ADJUSTED) {
+#define ADDUPLINK(NUMUPLINKS > 0 ? 1 : 0)
+          // this will only send broadcasts to the first (zeroeth) uplink.
+          // on a switch receiving broadcast packet from an uplink, this should
+          // automatically prevent switch from sending the broadcast to any
+          // uplink
+          for (int i = 0; i < NUMDOWNLINKS + ADDUPLINK; i++) {
+        if (i != tsp->sender) {
+          switchpacket *tsp2 = (switchpacket *)malloc(sizeof(switchpacket));
+          memcpy(tsp2, tsp, sizeof(switchpacket));
+          ports[i]->outputqueue.push(tsp2);
         }
-        free(tsp);
+      }
+      free(tsp);
     } else {
-        ports[send_to_port]->outputqueue.push(tsp);
+      ports[send_to_port]->outputqueue.push(tsp);
     }
-    */
+*/
     process_recv_packet((uint8_t *)tsp->dat);
     free(tsp);
   }
@@ -425,15 +439,22 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  // loading nf workload traces
-  load_pkt("/tmp/ictf2010_100kflow.dat");
-#define MAC_NFTOP 0x0200006d1200
-#define ETH_P_IP 0x0800 /* Internet Protocol packet	*/
-  for (int i = 0; i < PKT_NUM; i++) {
-    uint64_t *pkt_bytes = (uint64_t *)pkts[i].content;
-    pkt_bytes[0] = MAC_NFTOP << 16;
-    pkt_bytes[1] = MAC_NFTOP | ((uint64_t)htons(ETH_P_IP) << 48);
+  std::atomic_init(&num_ready_nfs, 0u);
+  std::atomic_init(&invalid_pkts, 0ul);
+  std::atomic_init(&num_finished_nfs, 0u);
+  std::atomic_init(&start_gen_pkt_timestamp, 0ul);
+  
+  for (int i = 0; i < NCORES; i++) {
+    std::atomic_init(&unack_pkts[i], 0ul);
+    std::atomic_init(&sent_pkts[i], 0ul);
+    std::atomic_init(&sent_pkts_size[i], 0ul);
+    std::atomic_init(&received_pkts[i], 0ul);
+    std::atomic_init(&lost_pkts[i], 0ul);
+    std::atomic_init(&last_gen_pkt_timestamp[i], 0ul);
+    std::atomic_init(&finish_gen_pkt_timestamp[i], 0ul);
   }
+  
+  load_nf_trace();
 
   omp_set_num_threads(
       NUMPORTS);  // we parallelize over ports, so max threads = # ports
