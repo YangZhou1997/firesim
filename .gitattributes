@@ -1,0 +1,2 @@
+target-design/switch/ictf2010_100kflow.h filter=lfs diff=lfs merge=lfs -text
+target-design/switch/ictf2010_100kflow_2mseq.h filter=lfs diff=lfs merge=lfs -text
