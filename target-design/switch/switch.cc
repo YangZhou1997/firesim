@@ -78,8 +78,8 @@ uint64_t this_iter_cycles_start = 0;
 #include "switchconfig.h"
 #undef MACPORTSCONFIG
 
-#include "baseport.h"
 #include "flit.h"
+#include "baseport.h"
 #include "shmemport.h"
 #include "socketport.h"
 #include "sshport.h"
