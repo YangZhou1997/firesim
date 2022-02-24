@@ -439,19 +439,19 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  std::atomic_init(&num_ready_nfs, 0u);
-  std::atomic_init(&invalid_pkts, 0ul);
-  std::atomic_init(&num_finished_nfs, 0u);
-  std::atomic_init(&start_gen_pkt_timestamp, 0ul);
+  num_ready_nfs = 0u;
+  invalid_pkts = 0ul;
+  num_finished_nfs, 0u;
+  start_gen_pkt_timestamp = 0ul;
   
   for (int i = 0; i < NCORES; i++) {
-    std::atomic_init(&unack_pkts[i], 0ul);
-    std::atomic_init(&sent_pkts[i], 0ul);
-    std::atomic_init(&sent_pkts_size[i], 0ul);
-    std::atomic_init(&received_pkts[i], 0ul);
-    std::atomic_init(&lost_pkts[i], 0ul);
-    std::atomic_init(&last_gen_pkt_timestamp[i], 0ul);
-    std::atomic_init(&finish_gen_pkt_timestamp[i], 0ul);
+    unack_pkts[i] = 0ul;
+    sent_pkts[i] = 0ul;
+    sent_pkts_size[i] = 0ul;
+    received_pkts[i] = 0ul;
+    lost_pkts[i] = 0ul;
+    last_gen_pkt_timestamp[i] = 0ul;
+    finish_gen_pkt_timestamp[i] = 0ul;
   }
   
   load_nf_trace();
