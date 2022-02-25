@@ -93,11 +93,12 @@ void load_nf_trace() {
   // loading nf workload traces
   load_pkt();
 #define MAC_NFTOP 0x0200006d1200
+#define MAC_PKTGEN 0x0300006d1200
 #define ETH_P_IP 0x0800 /* Internet Protocol packet	*/
   for (int i = 0; i < PKT_NUM; i++) {
     uint64_t *pkt_bytes = (uint64_t *)pkts[i].content;
     pkt_bytes[0] = MAC_NFTOP << 16;
-    pkt_bytes[1] = MAC_NFTOP | ((uint64_t)htons(ETH_P_IP) << 48);
+    pkt_bytes[1] = MAC_PKTGEN | ((uint64_t)htons(ETH_P_IP) << 48);
   }
 }
 
@@ -113,6 +114,7 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
   new_tsp->sender = 0;
   memcpy(new_tsp->dat, pkt->content, data_packet_size_bytes);
 
+  fprintf(stdout, "send_packet: data_packet_size_bytes = %d, new_tsp->amtwritten = %d\n", data_packet_size_bytes, new_tsp->amtwritten);
   ports[send_to_port]->outputqueue.push(new_tsp);
 }
 
@@ -122,10 +124,10 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 #define TEST_NPKTS (2 * 50 * 1024)
 #define PRINT_INTERVAL (10 * 1024)
 #define MAX_BATCH_SIZE 32
-#define MAX_UNACK_WINDOW 512
+#define MAX_UNACK_WINDOW 1
 #define CUSTOM_PROTO_BASE 0x1234
 
-#define TIMEOUT_CYCLES 2999538  // this is from empirical tests
+#define TIMEOUT_CYCLES 2999538000ul  // this is from empirical tests
 #define NCORES 4
 
 static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
@@ -148,7 +150,8 @@ void generate_load_packets() {
   if (num_ready_nfs != NCORES) {
     return;
   }
-  for (int nf_idx = 0; nf_idx < 4; nf_idx++) {
+  // for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
+  for (int nf_idx = 0; nf_idx < 1; nf_idx++) {
     // this NF has processed all packets.
     if (sent_pkts[nf_idx] > TEST_NPKTS) {
       if (!nf_finishness[nf_idx].test_and_set()) {
@@ -158,12 +161,13 @@ void generate_load_packets() {
         double time_taken =
             (finish_gen_pkt_timestamp[nf_idx] - start_gen_pkt_timestamp) /
             CPU_GHZ * 1e-3;
-        printf(
+        fprintf(
+            stdout,
             "[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %4llu, "
             "potentially lost pkts: %4llu, %.8lf Mpps, %.6lfGbps\n",
-            nf_idx, sent_pkts[nf_idx], unack_pkts[nf_idx], lost_pkts[nf_idx],
-            (double)(sent_pkts[nf_idx]) / time_taken,
-            (double)sent_pkts_size[nf_idx] * 8 / (time_taken * 1e3));
+            nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load(),
+            (double)(sent_pkts[nf_idx].load()) / time_taken,
+            (double)(sent_pkts_size[nf_idx].load()) * 8 / (time_taken * 1e3));
       }
       continue;
     }
@@ -175,7 +179,8 @@ void generate_load_packets() {
           TIMEOUT_CYCLES) {
         lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
         sent_pkts[nf_idx] = received_pkts[nf_idx].load();
-        printf(
+        fprintf(
+            stdout,
             "[send_pacekts th%d]: deadlock detected (caused by packet loss or "
             "NF initing), forcely resolving...\n",
             nf_idx);
@@ -187,16 +192,20 @@ void generate_load_packets() {
 
     uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
     burst_size = std::min(burst_size, TEST_NPKTS - sent_pkts[nf_idx]);
+    burst_size = std::min(burst_size, 1ul);
+
+    fprintf(stdout, "generate_load_packets generate packets %lu\n", burst_size);
 
     for (int i = 0; i < burst_size; i++) {
       pkt_t *pkt = next_pkt(nf_idx);
 
       auto eh = (struct ether_hdr *)(pkt->content + NET_IP_ALIGN);
-      eh->ether_type = htons((uint16_t)nf_idx + CUSTOM_PROTO_BASE);
+      eh->ether_type = htons(CUSTOM_PROTO_BASE + (uint16_t)nf_idx);
+      // TODO: having pkt isolated by different cores with a memcpy
 
       auto tcph = (struct tcp_hdr *)(pkt->content + NET_IP_ALIGN +
-                                sizeof(struct ipv4_hdr) +
-                                sizeof(struct ether_hdr));
+                                     sizeof(struct ether_hdr) + 
+                                     sizeof(struct ipv4_hdr));
       tcph->sent_seq = 0xdeadbeef;
       tcph->recv_ack = sent_pkts[nf_idx] + i;
 
@@ -211,10 +220,10 @@ void generate_load_packets() {
     if ((sent_pkts[nf_idx] / MAX_BATCH_SIZE) %
             (PRINT_INTERVAL / MAX_BATCH_SIZE) ==
         0) {
-      printf(
-          "[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %llu, "
-          "potentially lost pkts: %llu\n",
-          nf_idx, sent_pkts[nf_idx], unack_pkts[nf_idx], lost_pkts[nf_idx]);
+      fprintf(stdout,
+              "[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %llu, "
+              "potentially lost pkts: %llu\n",
+              nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load());
     }
   }
 }
@@ -226,6 +235,8 @@ void generate_load_packets() {
 void process_recv_packet(uint8_t *pkt_data) {
   struct ether_hdr *eh_recv = (struct ether_hdr *)(pkt_data + NET_IP_ALIGN);
   int ether_type = (int)htons((eh_recv->ether_type));
+  fprintf(stdout, "process_recv_packet recv one packet: ether_type %d\n",
+          ether_type);
   if (!(ether_type >= CUSTOM_PROTO_BASE &&
         ether_type < CUSTOM_PROTO_BASE + 2 * NCORES)) {
     return;
@@ -237,8 +248,10 @@ void process_recv_packet(uint8_t *pkt_data) {
     nf_idx -= NCORES;
     if (!nf_readyness[nf_idx].test_and_set()) {
       num_ready_nfs++;
+      fprintf(stdout, "process_recv_packet recv one boot packet\n");
       if (num_ready_nfs == NCORES) {
         start_gen_pkt_timestamp = this_iter_cycles_start;
+        fprintf(stdout, "process_recv_packet recv all boot packets\n");
       }
     }
     return;
@@ -247,8 +260,8 @@ void process_recv_packet(uint8_t *pkt_data) {
   struct tcp_hdr *tcph_recv =
       (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) +
                          sizeof(struct ether_hdr));
-  // printf("[recv_pacekts %d] nf_idx = %d, tcph->sent_seq = %x\n", nf_idx,
-  // nf_idx, tcph->sent_seq);
+  // fprintf(stdout, "[recv_pacekts %d] nf_idx = %d, tcph->sent_seq = %x\n",
+  // nf_idx, nf_idx, tcph->sent_seq);
 
   if (tcph_recv->sent_seq != 0xdeadbeef) {
     invalid_pkts++;
@@ -261,7 +274,7 @@ void process_recv_packet(uint8_t *pkt_data) {
   uint32_t lost_pkts = pkt_idx + 1 - curr_received_pkts;
 
   // TODO: the packets might get re-ordered.
-  // printf("%lu, %llu\n", pkt_idx, curr_received_pkts);
+  // fprintf(stdout, "%lu, %llu\n", pkt_idx, curr_received_pkts);
 
   // these packets are lost
   // if(lost_pkts != 0){
@@ -269,8 +282,8 @@ void process_recv_packet(uint8_t *pkt_data) {
   // }
 
   if (curr_received_pkts % PRINT_INTERVAL == 0) {
-    printf("[recv_pacekts th%d]: pkts received: %llu\n", nf_idx,
-           curr_received_pkts);
+    fprintf(stdout, "[recv_pacekts th%d]: pkts received: %llu\n", nf_idx,
+            curr_received_pkts);
   }
 
   if (tcph_recv->recv_ack == 0xFFFFFFFF) {
@@ -311,8 +324,8 @@ void do_fast_switching() {
         if (is_last_flit(input_port_buf, tokenno)) {
           current_port->input_in_progress = NULL;
           if (current_port->push_input(sp)) {
-            printf("packet timestamp: %ld, len: %ld, sender: %d\n",
-                   this_iter_cycles_start + tokenno, sp->amtwritten, port);
+            fprintf(stdout, "packet timestamp: %ld, len: %ld, sender: %d\n",
+                    this_iter_cycles_start + tokenno, sp->amtwritten, port);
           }
         }
       }
@@ -356,29 +369,30 @@ void do_fast_switching() {
     pqueue.pop();
     uint16_t send_to_port =
         get_port_from_flit(tsp->dat[0], 0 /* junk remove arg */);
-    // printf("packet for port: %x\n", send_to_port);
-    // printf("packet timestamp: %ld\n", tsp->timestamp);
+    // fprintf(stdout, "packet for port: %x\n", send_to_port);
+    // fprintf(stdout, "packet timestamp: %ld\n", tsp->timestamp);
     // we bypass the switching logic, just doing ack packet processing and load
     // generaion
-/*
-    if (send_to_port == BROADCAST_ADJUSTED) {
-#define ADDUPLINK(NUMUPLINKS > 0 ? 1 : 0)
-          // this will only send broadcasts to the first (zeroeth) uplink.
-          // on a switch receiving broadcast packet from an uplink, this should
-          // automatically prevent switch from sending the broadcast to any
-          // uplink
-          for (int i = 0; i < NUMDOWNLINKS + ADDUPLINK; i++) {
-        if (i != tsp->sender) {
-          switchpacket *tsp2 = (switchpacket *)malloc(sizeof(switchpacket));
-          memcpy(tsp2, tsp, sizeof(switchpacket));
-          ports[i]->outputqueue.push(tsp2);
+    /*
+        if (send_to_port == BROADCAST_ADJUSTED) {
+    #define ADDUPLINK(NUMUPLINKS > 0 ? 1 : 0)
+              // this will only send broadcasts to the first (zeroeth) uplink.
+              // on a switch receiving broadcast packet from an uplink, this
+    should
+              // automatically prevent switch from sending the broadcast to any
+              // uplink
+              for (int i = 0; i < NUMDOWNLINKS + ADDUPLINK; i++) {
+            if (i != tsp->sender) {
+              switchpacket *tsp2 = (switchpacket *)malloc(sizeof(switchpacket));
+              memcpy(tsp2, tsp, sizeof(switchpacket));
+              ports[i]->outputqueue.push(tsp2);
+            }
+          }
+          free(tsp);
+        } else {
+          ports[send_to_port]->outputqueue.push(tsp);
         }
-      }
-      free(tsp);
-    } else {
-      ports[send_to_port]->outputqueue.push(tsp);
-    }
-*/
+    */
     process_recv_packet((uint8_t *)tsp->dat);
     free(tsp);
   }
@@ -443,7 +457,7 @@ int main(int argc, char *argv[]) {
   invalid_pkts = 0ul;
   num_finished_nfs, 0u;
   start_gen_pkt_timestamp = 0ul;
-  
+
   for (int i = 0; i < NCORES; i++) {
     unack_pkts[i] = 0ul;
     sent_pkts[i] = 0ul;
@@ -453,7 +467,7 @@ int main(int argc, char *argv[]) {
     last_gen_pkt_timestamp[i] = 0ul;
     finish_gen_pkt_timestamp[i] = 0ul;
   }
-  
+
   load_nf_trace();
 
   omp_set_num_threads(

@@ -103,6 +103,7 @@ void BasePort::write_flits_to_output() {
 
         // confirm that a) we are allowed to send this out based on timestamp
         // b) we are allowed to send this out based on available space (TODO fix)
+        // fprintf(stdout, "outputtimestamp %lu vs. maxtime %lu\n", outputtimestamp, maxtime);
         if (outputtimestamp < maxtime) {
 #ifdef LIMITED_BUFSIZE
             // output-buffer size-based throttling, based on input time of first flit
@@ -127,8 +128,8 @@ void BasePort::write_flits_to_output() {
                 //printf("intended timestamp: %ld, actual timestamp: %ld, diff %ld\n", 
                 //        outputtimestamp, basetime + flitswritten, 
                 //        (int64_t)(basetime + flitswritten) - (int64_t)(outputtimestamp));
-                printf("packet timestamp: %ld, len: %ld, receiver: %d\n",
-                        basetime + flitswritten, thispacket->amtwritten, _portNo);
+                // fprintf(stdout, "packet timestamp: %ld, len: %ld, receiver: %d\n",
+                //         basetime + flitswritten, thispacket->amtwritten, _portNo);
             }
             for (;(i < thispacket->amtwritten) && (flitswritten < LINKLATENCY); i++) {
                 write_last_flit(current_output_buf, flitswritten, i == (thispacket->amtwritten-1));
@@ -145,6 +146,7 @@ void BasePort::write_flits_to_output() {
             }
             if (i == thispacket->amtwritten) {
                 // we finished sending this packet, so get rid of it
+                printf("finishing sending one packets");
                 outputqueue.pop();
                 free(thispacket);
             } else {
