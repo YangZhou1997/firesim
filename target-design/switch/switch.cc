@@ -171,8 +171,9 @@ void generate_load_packets() {
   for (int nf_idx = 0; nf_idx < 1; nf_idx++) {
     pkt_t *cur_sending_pkt_vec = sending_pkt_vec[nf_idx];
 
-    // this NF has processed all packets.
+    // check if this NF has processed all packets.
     if (sent_pkts[nf_idx] >= TEST_NPKTS + WARMUP_NPKTS) {
+      // first time arrive here
       if (!nf_finishness[nf_idx].test_and_set()) {
         num_finished_nfs++;
         finish_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
@@ -193,10 +194,17 @@ void generate_load_packets() {
       }
       continue;
     }
+
+    // calculate unacked_pkts
+    if (sent_pkts[nf_idx] < received_pkts[nf_idx]) {
+      unack_pkts[nf_idx] = 0;
+    } else {
+      unack_pkts[nf_idx] = sent_pkts[nf_idx] - received_pkts[nf_idx];
+    }
+
     // so many unacked packets, not send load packets.
-    if (sent_pkts[nf_idx] >= received_pkts[nf_idx] &&
-        (unack_pkts[nf_idx] = sent_pkts[nf_idx] - received_pkts[nf_idx]) >=
-            MAX_UNACK_WINDOW) {
+    if (unack_pkts[nf_idx] >= MAX_UNACK_WINDOW) {
+      // timeout triggered, force resolve
       if (this_iter_cycles_start - last_gen_pkt_timestamp[nf_idx] >
           TIMEOUT_CYCLES) {
         lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
@@ -217,8 +225,8 @@ void generate_load_packets() {
     uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
     burst_size =
         std::min(burst_size, TEST_NPKTS + WARMUP_NPKTS - sent_pkts[nf_idx]);
-    // fprintf(stdout, "generate_load_packets generate packets %lu\n",
-    // burst_size);
+    fprintf(stdout, "generate_load_packets generate packets burst_size %lu\n",
+            burst_size);
 
     for (int i = 0; i < burst_size; i++) {
       pkt_t *pkt = next_pkt(nf_idx);
@@ -249,7 +257,7 @@ void generate_load_packets() {
     sent_pkts[nf_idx] += burst_size;
 
     // warm up phase ends
-    if (!warmup_end[nf_idx].load() && sent_pkts[nf_idx] >= WARMUP_NPKTS) {
+    if (sent_pkts[nf_idx] >= WARMUP_NPKTS && !warmup_end[nf_idx].load()) {
       warmup_end[nf_idx] = (uint8_t)1;
       start_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
       sent_pkts_size[nf_idx] = 0;
@@ -322,10 +330,14 @@ void process_recv_packet(uint8_t *pkt_data) {
     fprintf(stdout, "total_pkt_cnt = %lu, avg pkt latency = %lu cycles\n",
             total_pkt_cnt, total_pkt_latency / total_pkt_cnt);
   }
+  if (pkt_idx >= WARMUP_NPKTS - 1 && !warmup_end_recv[nf_idx].load()) {
+    total_pkt_latency = 0;
+    total_pkt_cnt = 0;
+  }
 #endif
 
   // warm up phase ends
-  if (!warmup_end_recv[nf_idx].load() && pkt_idx >= WARMUP_NPKTS - 1) {
+  if (pkt_idx >= WARMUP_NPKTS - 1 && !warmup_end_recv[nf_idx].load()) {
     warmup_end_recv[nf_idx] = (uint8_t)1;
     int lost_pkt_during_cold_start = lost_pkts;
     printf(
