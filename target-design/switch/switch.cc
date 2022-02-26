@@ -304,6 +304,7 @@ void process_recv_packet(uint8_t *pkt_data) {
     invalid_pkts++;
     return;
   }
+  // TODO: indicating this NF is done
   if (tcph->recv_ack == 0xFFFFFFFF) {
     return;
   }
