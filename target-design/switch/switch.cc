@@ -78,7 +78,6 @@ uint64_t this_iter_cycles_start = 0;
 #include "switchconfig.h"
 #undef MACPORTSCONFIG
 
-#include "flit.h"
 #include "baseport.h"
 #include "shmemport.h"
 #include "socketport.h"
@@ -114,21 +113,30 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
   new_tsp->sender = 0;
   memcpy(new_tsp->dat, pkt->content, data_packet_size_bytes);
 
-  fprintf(stdout, "send_packet: data_packet_size_bytes = %d, new_tsp->amtwritten = %d\n", data_packet_size_bytes, new_tsp->amtwritten);
+  fprintf(
+      stdout,
+      "send_packet: data_packet_size_bytes = %d, new_tsp->amtwritten = %d\n",
+      data_packet_size_bytes, new_tsp->amtwritten);
   ports[send_to_port]->outputqueue.push(new_tsp);
 }
 
 // TODO: maybe only stop all other's pktgen after the slowest NF processes
 // certain number of packets
 
-#define TEST_NPKTS (2 * 50 * 1024)
-#define PRINT_INTERVAL (10 * 1024)
-#define MAX_BATCH_SIZE 32
+#define TEST_NPKTS 20000
+#define PRINT_INTERVAL 100
 #define MAX_UNACK_WINDOW 1
 #define CUSTOM_PROTO_BASE 0x1234
 
 #define TIMEOUT_CYCLES 2999538000ul  // this is from empirical tests
 #define NCORES 4
+
+#define MEASURE_TIMEOUT
+#ifdef MEASURE_TIMEOUT
+static uint64_t timestamps[TEST_NPKTS];
+static uint64_t total_pkt_latency = 0;
+static uint64_t total_pkt_cnt = 0;
+#endif
 
 static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
 static std::atomic<uint32_t> num_ready_nfs;
@@ -146,12 +154,18 @@ static std::atomic<uint32_t> num_finished_nfs;
 static std::atomic<uint64_t> start_gen_pkt_timestamp;
 static std::atomic<uint64_t> finish_gen_pkt_timestamp[NCORES] = {};
 
+static pkt_t sending_pkt_vec[NCORES][MAX_UNACK_WINDOW];
+
 void generate_load_packets() {
+  // not all NFs are ready, skip generating packets
   if (num_ready_nfs != NCORES) {
     return;
   }
+
   // for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
   for (int nf_idx = 0; nf_idx < 1; nf_idx++) {
+    pkt_t *cur_sending_pkt_vec = sending_pkt_vec[nf_idx];
+
     // this NF has processed all packets.
     if (sent_pkts[nf_idx] > TEST_NPKTS) {
       if (!nf_finishness[nf_idx].test_and_set()) {
@@ -163,9 +177,10 @@ void generate_load_packets() {
             CPU_GHZ * 1e-3;
         fprintf(
             stdout,
-            "[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %4llu, "
-            "potentially lost pkts: %4llu, %.8lf Mpps, %.6lfGbps\n",
-            nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load(),
+            "[send_pacekts th%d]:     pkts sent: %lu, unacked pkts: %4lu, "
+            "potentially lost pkts: %4lu, %.8lf Mpps, %.6lfGbps\n",
+            nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(),
+            lost_pkts[nf_idx].load(),
             (double)(sent_pkts[nf_idx].load()) / time_taken,
             (double)(sent_pkts_size[nf_idx].load()) * 8 / (time_taken * 1e3));
       }
@@ -177,6 +192,7 @@ void generate_load_packets() {
             MAX_UNACK_WINDOW) {
       if (this_iter_cycles_start - last_gen_pkt_timestamp[nf_idx] >
           TIMEOUT_CYCLES) {
+        last_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
         lost_pkts[nf_idx] += sent_pkts[nf_idx] - received_pkts[nf_idx];
         sent_pkts[nf_idx] = received_pkts[nf_idx].load();
         fprintf(
@@ -188,42 +204,46 @@ void generate_load_packets() {
         continue;
       }
     }
-    last_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
 
+    // the max number of packet sent per epoch is MAX_UNACK_WINDOW
     uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
     burst_size = std::min(burst_size, TEST_NPKTS - sent_pkts[nf_idx]);
-    burst_size = std::min(burst_size, 1ul);
-
     fprintf(stdout, "generate_load_packets generate packets %lu\n", burst_size);
 
     for (int i = 0; i < burst_size; i++) {
       pkt_t *pkt = next_pkt(nf_idx);
+      pkt_t *cur_sending_pkt = &cur_sending_pkt_vec[i];
+      memcpy(cur_sending_pkt, pkt, sizeof(pkt_t));
 
-      auto eh = (struct ether_hdr *)(pkt->content + NET_IP_ALIGN);
+      // setup differnt eth_type to differenciate different NFs' packets.
+      auto eh = (struct ether_hdr *)(cur_sending_pkt->content + NET_IP_ALIGN);
       eh->ether_type = htons(CUSTOM_PROTO_BASE + (uint16_t)nf_idx);
-      // TODO: having pkt isolated by different cores with a memcpy
 
-      auto tcph = (struct tcp_hdr *)(pkt->content + NET_IP_ALIGN +
-                                     sizeof(struct ether_hdr) + 
+      auto tcph = (struct tcp_hdr *)(cur_sending_pkt->content + NET_IP_ALIGN +
+                                     sizeof(struct ether_hdr) +
                                      sizeof(struct ipv4_hdr));
+      uint32_t pkt_idx = sent_pkts[nf_idx] + i;
       tcph->sent_seq = 0xdeadbeef;
-      tcph->recv_ack = sent_pkts[nf_idx] + i;
+      tcph->recv_ack = pkt_idx;
 
-      // inter-pkt frame
-      sent_pkts_size[nf_idx] += pkt->len + 20;
+#ifdef MEASURE_TIMEOUT
+      timestamps[pkt_idx] = this_iter_cycles_start;
+#endif
 
-      // ASSUME there is only one port
-      send_packet(pkt, 0);
+      // 20B inter-pkt frame
+      sent_pkts_size[nf_idx] += cur_sending_pkt->len + 20;
+
+      // assume there is only one port
+      send_packet(cur_sending_pkt, 0);
     }
     sent_pkts[nf_idx] += burst_size;
 
-    if ((sent_pkts[nf_idx] / MAX_BATCH_SIZE) %
-            (PRINT_INTERVAL / MAX_BATCH_SIZE) ==
-        0) {
+    if (sent_pkts[nf_idx] % PRINT_INTERVAL == 0) {
       fprintf(stdout,
-              "[send_pacekts th%d]:     pkts sent: %llu, unacked pkts: %llu, "
-              "potentially lost pkts: %llu\n",
-              nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load());
+              "[send_pacekts th%d]:     pkts sent: %lu, unacked pkts: %lu, "
+              "potentially lost pkts: %lu\n",
+              nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(),
+              lost_pkts[nf_idx].load());
     }
   }
 }
@@ -237,8 +257,10 @@ void process_recv_packet(uint8_t *pkt_data) {
   int ether_type = (int)htons((eh_recv->ether_type));
   fprintf(stdout, "process_recv_packet recv one packet: ether_type %d\n",
           ether_type);
+
   if (!(ether_type >= CUSTOM_PROTO_BASE &&
         ether_type < CUSTOM_PROTO_BASE + 2 * NCORES)) {
+    fprintf(stdout, "invalid packet ether_type: %hu\n", ether_type);
     return;
   }
 
@@ -257,23 +279,33 @@ void process_recv_packet(uint8_t *pkt_data) {
     return;
   }
 
-  struct tcp_hdr *tcph_recv =
+  struct tcp_hdr *tcph =
       (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) +
                          sizeof(struct ether_hdr));
   // fprintf(stdout, "[recv_pacekts %d] nf_idx = %d, tcph->sent_seq = %x\n",
   // nf_idx, nf_idx, tcph->sent_seq);
-
-  if (tcph_recv->sent_seq != 0xdeadbeef) {
+  if (tcph->sent_seq != 0xdeadbeef) {
     invalid_pkts++;
+    return;
+  }
+  if (tcph->recv_ack == 0xFFFFFFFF) {
     return;
   }
   received_pkts[nf_idx]++;
 
-  uint32_t pkt_idx = tcph_recv->recv_ack;
+  uint32_t pkt_idx = tcph->recv_ack;
   uint64_t curr_received_pkts = received_pkts[nf_idx];
   uint32_t lost_pkts = pkt_idx + 1 - curr_received_pkts;
 
-  // TODO: the packets might get re-ordered.
+#ifdef MEASURE_TIMEOUT
+  timestamps[pkt_idx] = this_iter_cycles_start - timestamps[pkt_idx];
+  total_pkt_latency += timestamps[pkt_idx];
+  total_pkt_cnt++;
+  fprintf(stdout, "avg pkt latency = %lu cycles\n",
+          total_pkt_latency / total_pkt_cnt);
+#endif
+
+  // TODO: handle re-ordered packets.
   // fprintf(stdout, "%lu, %llu\n", pkt_idx, curr_received_pkts);
 
   // these packets are lost
@@ -282,12 +314,8 @@ void process_recv_packet(uint8_t *pkt_data) {
   // }
 
   if (curr_received_pkts % PRINT_INTERVAL == 0) {
-    fprintf(stdout, "[recv_pacekts th%d]: pkts received: %llu\n", nf_idx,
+    fprintf(stdout, "[recv_pacekts th%d]: pkts received: %lu\n", nf_idx,
             curr_received_pkts);
-  }
-
-  if (tcph_recv->recv_ack == 0xFFFFFFFF) {
-    return;
   }
 }
 

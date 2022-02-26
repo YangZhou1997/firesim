@@ -1,3 +1,5 @@
+#include "flit.h"
+
 #define FLIT_BITS 64
 #define BITTIME_PER_QUANTA 512
 #define CYCLES_PER_QUANTA (BITTIME_PER_QUANTA / FLIT_BITS)

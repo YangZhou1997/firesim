@@ -5,6 +5,8 @@
 #include <linux/if.h>
 #include <linux/if_tun.h>
 
+#include "flit.h"
+
 #define NET_IP_ALIGN 2
 #define ETH_MAX_WORDS 190
 #define ETH_MAX_BYTES 1518
