@@ -225,8 +225,9 @@ void generate_load_packets() {
     uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
     burst_size =
         std::min(burst_size, TEST_NPKTS + WARMUP_NPKTS - sent_pkts[nf_idx]);
-    fprintf(stdout, "generate_load_packets generate packets burst_size %lu\n",
-            burst_size);
+    // fprintf(stdout, "generate_load_packets generate packets burst_size
+    // %lu\n",
+    //         burst_size);
 
     for (int i = 0; i < burst_size; i++) {
       pkt_t *pkt = next_pkt(nf_idx);
