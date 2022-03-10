@@ -133,7 +133,8 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 #define TIMEOUT_CYCLES (100000 * 20000ul)
 #define NCORES 4
 
-#define MEASURE_TIMEOUT
+// TODO: embedding the latency into packets
+// #define MEASURE_TIMEOUT
 #ifdef MEASURE_TIMEOUT
 static uint64_t timestamps[TEST_NPKTS + WARMUP_NPKTS];
 static uint64_t total_pkt_latency = 0;
@@ -144,6 +145,7 @@ static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
 static std::atomic<uint32_t> num_ready_nfs;
 static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
 static std::atomic<uint32_t> num_finished_nfs;
+static std::atomic<uint8_t> nf_recv_end_pkt[NCORES] = {};
 
 static std::atomic<uint64_t> unack_pkts[NCORES] = {};
 static std::atomic<uint64_t> sent_pkts[NCORES] = {};
@@ -169,31 +171,12 @@ void generate_load_packets() {
 
   // for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
   for (int nf_idx = 0; nf_idx < 1; nf_idx++) {
-    pkt_t *cur_sending_pkt_vec = sending_pkt_vec[nf_idx];
-
-    // check if this NF has processed all packets.
-    if (sent_pkts[nf_idx] >= TEST_NPKTS + WARMUP_NPKTS) {
-      // first time arrive here
-      if (!nf_finishness[nf_idx].test_and_set()) {
-        num_finished_nfs++;
-        finish_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
-#define CPU_GHZ (3.2)
-        double time_taken = (finish_gen_pkt_timestamp[nf_idx] -
-                             start_gen_pkt_timestamp[nf_idx]) /
-                            CPU_GHZ * 1e-3;
-        sent_pkts[nf_idx] -= WARMUP_NPKTS;
-        received_pkts[nf_idx] -= WARMUP_NPKTS;
-        fprintf(
-            stdout,
-            "[send_pacekts th%d]:     pkts sent: %lu, unacked pkts: %4lu, "
-            "potentially lost pkts: %4lu, %.8lf Mpps, %.6lfGbps\n",
-            nf_idx, sent_pkts[nf_idx].load(), unack_pkts[nf_idx].load(),
-            lost_pkts[nf_idx].load(),
-            (double)(sent_pkts[nf_idx].load()) / time_taken,
-            (double)(sent_pkts_size[nf_idx].load()) * 8 / (time_taken * 1e3));
-      }
+    // check if the NF has finished, nf_recv_end_pkt is set by
+    // process_recv_packet().
+    if (nf_recv_end_pkt[nf_idx].load()) {
       continue;
     }
+    pkt_t *cur_sending_pkt_vec = sending_pkt_vec[nf_idx];
 
     // calculate unacked_pkts
     if (sent_pkts[nf_idx] < received_pkts[nf_idx]) {
@@ -223,11 +206,7 @@ void generate_load_packets() {
 
     // the max number of packet sent per epoch is MAX_UNACK_WINDOW
     uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
-    burst_size =
-        std::min(burst_size, TEST_NPKTS + WARMUP_NPKTS - sent_pkts[nf_idx]);
-    // fprintf(stdout, "generate_load_packets generate packets burst_size
-    // %lu\n",
-    //         burst_size);
+    // fprintf(stdout, "burst_size %lu\n ", burst_size);
 
     for (int i = 0; i < burst_size; i++) {
       pkt_t *pkt = next_pkt(nf_idx);
@@ -246,6 +225,7 @@ void generate_load_packets() {
       tcph->recv_ack = pkt_idx;
 
 #ifdef MEASURE_TIMEOUT
+      // be carefull: this might trigger SEGV
       timestamps[pkt_idx] = this_iter_cycles_start;
 #endif
 
@@ -286,7 +266,11 @@ void process_recv_packet(uint8_t *pkt_data) {
 
   if (!(ether_type >= CUSTOM_PROTO_BASE &&
         ether_type < CUSTOM_PROTO_BASE + 2 * NCORES)) {
-    fprintf(stdout, "invalid packet ether_type: %hu\n", ether_type);
+    struct tcp_hdr *tcph =
+        (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) +
+                           sizeof(struct ether_hdr));
+    fprintf(stdout, "invalid packet ether_type: %hu tcph->sent_seq: %x\n",
+            ether_type, tcph->sent_seq);
     return;
   }
 
@@ -313,8 +297,28 @@ void process_recv_packet(uint8_t *pkt_data) {
     invalid_pkts++;
     return;
   }
-  // TODO: indicating this NF is done
+  // indicating this NF is done
   if (tcph->recv_ack == 0xFFFFFFFF) {
+    nf_recv_end_pkt[nf_idx] = 0;
+    // first time arrive here
+    if (!nf_finishness[nf_idx].test_and_set()) {
+      num_finished_nfs++;
+      finish_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
+#define CPU_GHZ (3.2)
+      double time_taken =
+          (finish_gen_pkt_timestamp[nf_idx] - start_gen_pkt_timestamp[nf_idx]) /
+          CPU_GHZ * 1e-3;
+      // sent_pkts[nf_idx] -= WARMUP_NPKTS;
+      // received_pkts[nf_idx] -= WARMUP_NPKTS;
+      fprintf(stdout,
+              "[send_pacekts th%d]:     pkts sent: %lu, unacked pkts: %4lu, "
+              "potentially lost pkts: %4lu, %.8lf Mpps, %.6lfGbps\n",
+              nf_idx, sent_pkts[nf_idx].load() - WARMUP_NPKTS,
+              unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load(),
+              (double)(sent_pkts[nf_idx].load() - WARMUP_NPKTS) / time_taken,
+              (double)(sent_pkts_size[nf_idx].load()) * 8 / (time_taken * 1e3));
+    }
+
     return;
   }
   received_pkts[nf_idx]++;
@@ -538,6 +542,7 @@ int main(int argc, char *argv[]) {
     start_gen_pkt_timestamp[i] = 0ul;
     warmup_end[i] = (uint8_t)0;
     warmup_end_recv[i] = (uint8_t)0;
+    nf_recv_end_pkt[i] = (uint8_t)0;
   }
 
   load_nf_trace();
