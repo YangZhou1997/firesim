@@ -127,7 +127,7 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 // TODO: remove this TEST_NPKTS
 #define TEST_NPKTS 20000
 #define PRINT_INTERVAL 1000
-#define MAX_UNACK_WINDOW 512
+#define MAX_UNACK_WINDOW 256
 #define CUSTOM_PROTO_BASE 0x1234
 
 // l2_fwd has around 20000 cycles latency, we time it by 100000x
@@ -313,9 +313,10 @@ void process_recv_packet(uint8_t *pkt_data) {
       // received_pkts[nf_idx] -= WARMUP_NPKTS;
       fprintf(stdout,
               "[send_pacekts th%d]:     pkts sent: %lu, unacked pkts: %4lu, "
-              "potentially lost pkts: %4lu, %.8lf Mpps, %.6lfGbps\n",
+              "potentially lost pkts: %4lu, time_taken %.1lf us, %.8lf Mpps, "
+              "%.6lfGbps\n",
               nf_idx, sent_pkts[nf_idx].load() - WARMUP_NPKTS,
-              unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load(),
+              unack_pkts[nf_idx].load(), lost_pkts[nf_idx].load(), time_taken,
               (double)(sent_pkts[nf_idx].load() - WARMUP_NPKTS) / time_taken,
               (double)(sent_pkts_size[nf_idx].load()) * 8 / (time_taken * 1e3));
     }
