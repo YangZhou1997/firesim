@@ -127,7 +127,7 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 // TODO: remove this TEST_NPKTS
 #define TEST_NPKTS 20000
 #define PRINT_INTERVAL 1000
-#define MAX_UNACK_WINDOW 256
+#define MAX_UNACK_WINDOW 40
 #define CUSTOM_PROTO_BASE 0x1234
 
 // l2_fwd has around 20000 cycles latency, we time it by 100000x
