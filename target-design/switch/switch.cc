@@ -127,7 +127,7 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 // TODO: remove this TEST_NPKTS
 #define TEST_NPKTS 20000
 #define PRINT_INTERVAL 1000
-#define MAX_UNACK_WINDOW 40
+#define MAX_UNACK_WINDOW 20
 #define CUSTOM_PROTO_BASE 0x1234
 
 // l2_fwd has around 20000 cycles latency, we time it by 100000x
@@ -170,8 +170,7 @@ void generate_load_packets() {
     return;
   }
 
-  // for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
-  for (int nf_idx = 0; nf_idx < 2; nf_idx++) {
+  for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
     // check if the NF has finished, nf_recv_end_pkt is set by
     // process_recv_packet().
     if (nf_recv_end_pkt[nf_idx].load()) {
