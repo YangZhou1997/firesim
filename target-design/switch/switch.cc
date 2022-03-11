@@ -124,6 +124,7 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 // certain number of packets
 
 #define WARMUP_NPKTS 10000
+// TODO: remove this TEST_NPKTS
 #define TEST_NPKTS 20000
 #define PRINT_INTERVAL 1000
 #define MAX_UNACK_WINDOW 512
@@ -170,7 +171,7 @@ void generate_load_packets() {
   }
 
   // for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
-  for (int nf_idx = 0; nf_idx < 1; nf_idx++) {
+  for (int nf_idx = 0; nf_idx < 2; nf_idx++) {
     // check if the NF has finished, nf_recv_end_pkt is set by
     // process_recv_packet().
     if (nf_recv_end_pkt[nf_idx].load()) {
@@ -318,7 +319,6 @@ void process_recv_packet(uint8_t *pkt_data) {
               (double)(sent_pkts[nf_idx].load() - WARMUP_NPKTS) / time_taken,
               (double)(sent_pkts_size[nf_idx].load()) * 8 / (time_taken * 1e3));
     }
-
     return;
   }
   received_pkts[nf_idx]++;
