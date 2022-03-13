@@ -192,6 +192,7 @@ void generate_load_packets() {
     return;
   }
 
+  // TODO(yangzhou): mixing different NFs' packets in sendinng queue
   for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
     pkt_t *cur_sending_pkt_vec = sending_pkt_vec[nf_idx];
 
@@ -381,13 +382,13 @@ void process_recv_packet(uint8_t *pkt_data) {
       if (num_finished_nfs.fetch_add(1) == num_nfs - 1) {
         for (int i = 0; i < NCORES; i++) {
           // so that generate_load_packets() for this nf_idx will stop
-          nf_recv_end_pkt[i] = 0;
+          nf_recv_end_pkt[i] = 1;
           print_stats(i);
         }
       }
 #else
       // so that generate_load_packets() for this nf_idx will stop
-      nf_recv_end_pkt[nf_idx] = 0;
+      nf_recv_end_pkt[nf_idx] = 1;
       print_stats(nf_idx);
 #endif
     }
