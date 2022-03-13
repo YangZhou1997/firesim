@@ -16,6 +16,7 @@
 #include <numeric>
 #include <queue>
 #include <vector>
+#include <deque>
 
 #include "nf_trace.h"
 
@@ -119,6 +120,19 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
   ports[send_to_port]->outputqueue.push(new_tsp);
 }
 
+void permutate_output_queue(uint16_t send_to_port) {
+  std::queue<switchpacket*>& output_queue = ports[send_to_port]->outputqueue;
+  std::deque<switchpacket*> shuffle_queue;
+  while(!output_queue.empty()) {
+    shuffle_queue.push_back(output_queue.front());
+    output_queue.pop();
+  }
+  std::random_shuffle(shuffle_queue.begin(), shuffle_queue.end());
+  for (auto item : shuffle_queue) {
+    output_queue.push(item);
+  }
+}
+
 #define WARMUP_NPKTS 10000
 #define TEST_NPKTS 20000
 #define PRINT_INTERVAL 1000
@@ -157,8 +171,9 @@ static double nth_percentile(std::vector<double> &vec, double percentile) {
 // storing per-NF per-packet latency
 static std::vector<double> latencies[NCORES];
 
-static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
-static std::atomic<uint32_t> num_ready_nfs;
+// indicating how many cores has sent a boot packet, requiring NCORES
+static std::atomic<uint32_t> num_ready_cores;
+static std::atomic_flag core_readyness[NCORES] = {ATOMIC_FLAG_INIT};
 
 static std::atomic<uint64_t> unack_pkts[NCORES] = {};
 static std::atomic<uint64_t> sent_pkts[NCORES] = {};
@@ -176,11 +191,14 @@ static std::atomic<uint8_t> warmup_end_recv[NCORES] = {};
 
 static pkt_t sending_pkt_vec[NCORES][MAX_UNACK_WINDOW];
 
-// Each NF keep running even when it has processed TEST_NPKTS + WARMUP_NPKTS of
+// Option 1: All NF only processes TEST_NPKTS + WARMUP_NPKTS of packets and end itself.
+// Option 2: Each NF keeps running even when it has processed TEST_NPKTS + WARMUP_NPKTS of
 // packets; it only ends itself after the slowest NF has processed TEST_NPKTS +
 // WARMUP_NPKTS of packets.
 #define KEEP_RUNNING
-static int num_nfs = 0;
+
+// NUM_NFS is embedded in the nic boot packets.
+static int NUM_NFS = 0;
 static std::atomic<uint32_t> num_finished_nfs;
 static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
 static std::atomic<uint8_t> nf_recv_end_pkt[NCORES] = {};
@@ -188,19 +206,18 @@ static std::atomic_flag nf_recv_end_pkt_sent[NCORES] = {ATOMIC_FLAG_INIT};
 
 void generate_load_packets() {
   // not all NFs are ready, skip generating packets
-  if (num_ready_nfs != NCORES) {
+  if (num_ready_cores != NCORES) {
     return;
   }
 
-  // TODO(yangzhou): mixing different NFs' packets in sendinng queue
-  for (int nf_idx = 0; nf_idx < NCORES; nf_idx++) {
+  for (int nf_idx = 0; nf_idx < NUM_NFS; nf_idx++) {
     pkt_t *cur_sending_pkt_vec = sending_pkt_vec[nf_idx];
 
     // check if the NF has finished
     // note that nf_recv_end_pkt is set by process_recv_packet().
     if (nf_recv_end_pkt[nf_idx].load()) {
       // first time arriving here will send an end pkt to NF
-      if (!nf_recv_end_pkt_sent->test_and_set()) {
+      if (!nf_recv_end_pkt_sent[nf_idx].test_and_set()) {
         pkt_t *pkt = next_pkt(nf_idx);
         pkt_t *cur_sending_pkt = &cur_sending_pkt_vec[0];
         memcpy(cur_sending_pkt, pkt, sizeof(pkt_t));
@@ -296,6 +313,9 @@ void generate_load_packets() {
               lost_pkts[nf_idx].load());
     }
   }
+
+  // mixing different NFs' packets in sending queue
+  permutate_output_queue(0);
 }
 
 // Processing packet received from the NIC, updating the above states
@@ -324,11 +344,11 @@ void process_recv_packet(uint8_t *pkt_data) {
   int nf_idx = ether_type - CUSTOM_PROTO_BASE;
   if (nf_idx >= NCORES) {
     nf_idx -= NCORES;
-    if (!nf_readyness[nf_idx].test_and_set()) {
-      num_nfs = htons(ipv4->packet_id);
-      num_ready_nfs++;
+    if (!core_readyness[nf_idx].test_and_set()) {
+      NUM_NFS = htons(ipv4->packet_id);
+      num_ready_cores++;
       fprintf(stdout, "process_recv_packet recv one boot packet\n");
-      if (num_ready_nfs == NCORES) {
+      if (num_ready_cores == NCORES) {
         fprintf(stdout, "process_recv_packet recv all boot packets\n");
       }
     }
@@ -379,8 +399,8 @@ void process_recv_packet(uint8_t *pkt_data) {
       };
 
 #ifdef KEEP_RUNNING
-      if (num_finished_nfs.fetch_add(1) == num_nfs - 1) {
-        for (int i = 0; i < NCORES; i++) {
+      if (num_finished_nfs.fetch_add(1) == NUM_NFS - 1) {
+        for (int i = 0; i < NUM_NFS; i++) {
           // so that generate_load_packets() for this nf_idx will stop
           nf_recv_end_pkt[i] = 1;
           print_stats(i);
@@ -599,7 +619,7 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
-  num_ready_nfs = 0u;
+  num_ready_cores = 0u;
   invalid_pkts = 0ul;
   num_finished_nfs = 0u;
 
