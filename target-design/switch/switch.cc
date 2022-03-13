@@ -180,9 +180,7 @@ static pkt_t sending_pkt_vec[NCORES][MAX_UNACK_WINDOW];
 // packets; it only ends itself after the slowest NF has processed TEST_NPKTS +
 // WARMUP_NPKTS of packets.
 #define KEEP_RUNNING
-// TODO(yangzhou): embed num_nfs into boot packets.
-// Or, specifying NUM_NFS in config.ini
-#define NUM_NFS 4
+static int num_nfs = 0;
 static std::atomic<uint32_t> num_finished_nfs;
 static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
 static std::atomic<uint8_t> nf_recv_end_pkt[NCORES] = {};
@@ -305,14 +303,17 @@ void generate_load_packets() {
 // NIC core to indicate the readyness of one NF
 void process_recv_packet(uint8_t *pkt_data) {
   struct ether_hdr *eh_recv = (struct ether_hdr *)(pkt_data + NET_IP_ALIGN);
+  struct ipv4_hdr *ipv4 =
+      (struct ipv4_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ether_hdr));
+  struct tcp_hdr *tcph =
+      (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ether_hdr) +
+                         sizeof(struct ipv4_hdr));
+
   int ether_type = (int)htons((eh_recv->ether_type));
 
   // filtering non-related packets
   if (!(ether_type >= CUSTOM_PROTO_BASE &&
         ether_type < CUSTOM_PROTO_BASE + 2 * NCORES)) {
-    struct tcp_hdr *tcph =
-        (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) +
-                           sizeof(struct ether_hdr));
     fprintf(stdout, "invalid packet ether_type: %hu tcph->sent_seq: %x\n",
             ether_type, tcph->sent_seq);
     return;
@@ -323,6 +324,7 @@ void process_recv_packet(uint8_t *pkt_data) {
   if (nf_idx >= NCORES) {
     nf_idx -= NCORES;
     if (!nf_readyness[nf_idx].test_and_set()) {
+      num_nfs = htons(ipv4->packet_id);
       num_ready_nfs++;
       fprintf(stdout, "process_recv_packet recv one boot packet\n");
       if (num_ready_nfs == NCORES) {
@@ -331,10 +333,6 @@ void process_recv_packet(uint8_t *pkt_data) {
     }
     return;
   }
-
-  struct tcp_hdr *tcph =
-      (struct tcp_hdr *)(pkt_data + NET_IP_ALIGN + sizeof(struct ipv4_hdr) +
-                         sizeof(struct ether_hdr));
 
   // filtering non-related packets
   if (tcph->sent_seq != 0xdeadbeef) {
@@ -380,7 +378,7 @@ void process_recv_packet(uint8_t *pkt_data) {
       };
 
 #ifdef KEEP_RUNNING
-      if (num_finished_nfs.fetch_add(1) == NUM_NFS - 1) {
+      if (num_finished_nfs.fetch_add(1) == num_nfs - 1) {
         for (int i = 0; i < NCORES; i++) {
           // so that generate_load_packets() for this nf_idx will stop
           nf_recv_end_pkt[i] = 0;
