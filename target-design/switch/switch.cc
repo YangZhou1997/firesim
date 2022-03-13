@@ -159,9 +159,6 @@ static std::vector<double> latencies[NCORES];
 
 static std::atomic_flag nf_readyness[NCORES] = {ATOMIC_FLAG_INIT};
 static std::atomic<uint32_t> num_ready_nfs;
-static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
-static std::atomic<uint8_t> nf_recv_end_pkt[NCORES] = {};
-static std::atomic_flag nf_recv_end_pkt_sent[NCORES] = {ATOMIC_FLAG_INIT};
 
 static std::atomic<uint64_t> unack_pkts[NCORES] = {};
 static std::atomic<uint64_t> sent_pkts[NCORES] = {};
@@ -183,9 +180,13 @@ static pkt_t sending_pkt_vec[NCORES][MAX_UNACK_WINDOW];
 // packets; it only ends itself after the slowest NF has processed TEST_NPKTS +
 // WARMUP_NPKTS of packets.
 #define KEEP_RUNNING
-// TODO(yangzhou): specifying NUM_NFS in config.ini
+// TODO(yangzhou): embed num_nfs into boot packets.
+// Or, specifying NUM_NFS in config.ini
 #define NUM_NFS 4
 static std::atomic<uint32_t> num_finished_nfs;
+static std::atomic_flag nf_finishness[NCORES] = {ATOMIC_FLAG_INIT};
+static std::atomic<uint8_t> nf_recv_end_pkt[NCORES] = {};
+static std::atomic_flag nf_recv_end_pkt_sent[NCORES] = {ATOMIC_FLAG_INIT};
 
 void generate_load_packets() {
   // not all NFs are ready, skip generating packets
