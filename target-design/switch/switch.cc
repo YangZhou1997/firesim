@@ -12,11 +12,11 @@
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <numeric>
 #include <queue>
 #include <vector>
-#include <deque>
 
 #include "nf_trace.h"
 
@@ -121,9 +121,9 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 }
 
 void permutate_output_queue(uint16_t send_to_port) {
-  std::queue<switchpacket*>& output_queue = ports[send_to_port]->outputqueue;
-  std::deque<switchpacket*> shuffle_queue;
-  while(!output_queue.empty()) {
+  std::queue<switchpacket *> &output_queue = ports[send_to_port]->outputqueue;
+  std::deque<switchpacket *> shuffle_queue;
+  while (!output_queue.empty()) {
     shuffle_queue.push_back(output_queue.front());
     output_queue.pop();
   }
@@ -191,10 +191,10 @@ static std::atomic<uint8_t> warmup_end_recv[NCORES] = {};
 
 static pkt_t sending_pkt_vec[NCORES][MAX_UNACK_WINDOW];
 
-// Option 1: All NF only processes TEST_NPKTS + WARMUP_NPKTS of packets and end itself.
-// Option 2: Each NF keeps running even when it has processed TEST_NPKTS + WARMUP_NPKTS of
-// packets; it only ends itself after the slowest NF has processed TEST_NPKTS +
-// WARMUP_NPKTS of packets.
+// Option 1: All NF only processes TEST_NPKTS + WARMUP_NPKTS of packets and end
+// itself. Option 2: Each NF keeps running even when it has processed TEST_NPKTS
+// + WARMUP_NPKTS of packets; it only ends itself after the slowest NF has
+// processed TEST_NPKTS + WARMUP_NPKTS of packets.
 #define KEEP_RUNNING
 
 // NUM_NFS is embedded in the nic boot packets.
@@ -216,26 +216,24 @@ void generate_load_packets() {
     // check if the NF has finished
     // note that nf_recv_end_pkt is set by process_recv_packet().
     if (nf_recv_end_pkt[nf_idx].load()) {
-      // first time arriving here will send an end pkt to NF
-      if (!nf_recv_end_pkt_sent[nf_idx].test_and_set()) {
-        pkt_t *pkt = next_pkt(nf_idx);
-        pkt_t *cur_sending_pkt = &cur_sending_pkt_vec[0];
-        memcpy(cur_sending_pkt, pkt, sizeof(pkt_t));
+      // keep sending end pkts to NF
+      pkt_t *pkt = next_pkt(nf_idx);
+      pkt_t *cur_sending_pkt = &cur_sending_pkt_vec[0];
+      memcpy(cur_sending_pkt, pkt, sizeof(pkt_t));
 
-        // setup differnt eth_type to differenciate different NFs' packets.
-        auto eh = (struct ether_hdr *)(cur_sending_pkt->content + NET_IP_ALIGN);
-        eh->ether_type = htons(CUSTOM_PROTO_BASE + (uint16_t)nf_idx);
+      // setup differnt eth_type to differenciate different NFs' packets.
+      auto eh = (struct ether_hdr *)(cur_sending_pkt->content + NET_IP_ALIGN);
+      eh->ether_type = htons(CUSTOM_PROTO_BASE + (uint16_t)nf_idx);
 
-        auto tcph = (struct tcp_hdr *)(cur_sending_pkt->content + NET_IP_ALIGN +
-                                       sizeof(struct ether_hdr) +
-                                       sizeof(struct ipv4_hdr));
-        uint32_t pkt_idx = sent_pkts[nf_idx] + 0;
-        tcph->sent_seq = 0xdeadbeef;
-        tcph->recv_ack = 0xFFFFFFFF;
+      auto tcph = (struct tcp_hdr *)(cur_sending_pkt->content + NET_IP_ALIGN +
+                                     sizeof(struct ether_hdr) +
+                                     sizeof(struct ipv4_hdr));
+      uint32_t pkt_idx = sent_pkts[nf_idx] + 0;
+      tcph->sent_seq = 0xdeadbeef;
+      tcph->recv_ack = 0xFFFFFFFF;
 
-        // assume there is only one port
-        send_packet(cur_sending_pkt, 0);
-      }
+      // assume there is only one port
+      send_packet(cur_sending_pkt, 0);
       continue;
     }
 
