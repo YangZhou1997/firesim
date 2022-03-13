@@ -127,7 +127,11 @@ void send_packet(pkt_t *pkt, uint16_t send_to_port) {
 // TODO: remove this TEST_NPKTS
 #define TEST_NPKTS 20000
 #define PRINT_INTERVAL 1000
-#define MAX_UNACK_WINDOW 20
+// maximum in-flight packets
+#define MAX_UNACK_WINDOW 512
+// each switching round can only process 6405 words (8Bytes), given 620B
+// packets, this is equal to around 82
+#define MAX_PKTS_PER_ROUND 20
 #define CUSTOM_PROTO_BASE 0x1234
 
 // l2_fwd has around 20000 cycles latency, we time it by 100000x
@@ -204,8 +208,10 @@ void generate_load_packets() {
     }
     last_gen_pkt_timestamp[nf_idx] = this_iter_cycles_start;
 
-    // the max number of packet sent per epoch is MAX_UNACK_WINDOW
-    uint64_t burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
+    // the number of maximum infligh packets is MAX_UNACK_WINDOW
+    int burst_size = MAX_UNACK_WINDOW - unack_pkts[nf_idx];
+    // maximum packets sent this round is limited to MAX_PKTS_PER_ROUND
+    burst_size = std::min(burst_size, MAX_PKTS_PER_ROUND);
     // fprintf(stdout, "burst_size %lu\n ", burst_size);
 
     for (int i = 0; i < burst_size; i++) {
